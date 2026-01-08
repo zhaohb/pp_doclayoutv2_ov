@@ -150,11 +150,6 @@ for box in result.boxes:
 
 This project is based on PaddleOCR's PP-DocLayoutV2 model. Please follow the corresponding open source license.
 
-## 🙏 Acknowledgments
-
-- [PaddleOCR](https://github.com/PaddlePaddle/PaddleOCR) - Provides the original model and reference implementation
-- [OpenVINO](https://github.com/openvinotoolkit/openvino) - Provides high-performance inference engine
-
 ## 📧 Contact
 
 For questions or suggestions, please submit an Issue or Pull Request.
