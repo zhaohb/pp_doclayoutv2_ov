@@ -10,7 +10,7 @@ This project provides a complete implementation for running PP-DocLayoutV2 docum
 
 - ✅ Complete OpenVINO IR model inference implementation
 - ✅ Fully consistent with PaddleOCR preprocessing and post-processing logic
-- ✅ Support for multiple inference devices: CPU, GPU, AUTO
+- ✅ Support for multiple inference devices: CPU, GPU, NPU, AUTO
 - ✅ Command-line parameterization for easy integration and use
 - ✅ Automatic saving of detection results (JSON and visualization images)
 - ✅ Support for 25 types of document layout element detection
