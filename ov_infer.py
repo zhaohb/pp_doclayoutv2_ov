@@ -577,7 +577,16 @@ def paddle_ov_doclayout(model_path, image_path, output_dir, device="GPU", thresh
     prep.input("image").tensor().set_layout(ov.Layout("NCHW"))
     prep.input("image").preprocess().scale([255, 255, 255])
 
+    if device == "NPU":
+        prep.input("im_shape").model().set_layout(ov.Layout('N...'))
+        prep.input("scale_factor").model().set_layout(ov.Layout('N...'))
+        prep.input("image").model().set_layout(ov.Layout('NCHW'))
+
     model = prep.build()
+
+    # Set batch to make static
+    if device == "NPU":
+        ov.set_batch(model, 1)
 
     # 编译模型
     compiled_model = core.compile_model(model, device)
@@ -694,7 +703,7 @@ def main():
         "--device",
         type=str,
         default="GPU",
-        choices=["CPU", "GPU", "AUTO"],
+        choices=["CPU", "GPU", "NPU", "AUTO"],
         help="推理设备 (默认: GPU)"
     )
     parser.add_argument(
