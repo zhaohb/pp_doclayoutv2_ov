@@ -368,6 +368,205 @@ class LayoutDetectionResult:
             save_path.parent.mkdir(parents=True, exist_ok=True)
             img[list(img.keys())[0]].save(save_path)
 
+
+
+def postprocess_detections_paddle_nms(output, orig_h, orig_w, threshold=0.5,
+                                     layout_nms=False, layout_unclip_ratio=None, layout_merge_bboxes_mode=None):
+    """
+    Postprocess PaddleDetection-style exported outputs.
+
+    Common output format from Paddle export (already NMS-ed in graph):
+      - fetch_name_0: [Nmax, 6] or [Nmax, 7]
+        If 7 cols: [image_id, class_id, score, x1, y1, x2, y2]
+        If 6 cols: [class_id, score, x1, y1, x2, y2]
+      - fetch_name_1: [1] int32, bbox_num (valid number of boxes)
+
+    Returns:
+      list[dict] in the same format as restructured_boxes()
+    """
+    if not isinstance(output, (list, tuple)) or len(output) < 1:
+        raise ValueError("output must be a list/tuple with at least one output tensor")
+
+    out0 = np.array(output[0])
+    out1 = np.array(output[1]) if len(output) > 1 and output[1] is not None else None
+
+    if out0.ndim != 2 or out0.shape[1] < 6:
+        raise ValueError(f"Unsupported Paddle NMS output shape: {out0.shape}")
+
+    # valid count
+    if out1 is not None and out1.size > 0:
+        num = int(out1.reshape(-1)[0])
+        num = max(0, min(num, out0.shape[0]))
+    else:
+        num = out0.shape[0]
+
+    det = out0[:num]
+    if det.size == 0:
+        return []
+
+    # -------- Decode NMS table robustly (column order differs across Paddle export versions) --------
+    def _score_mapping(cls_col, score_col, coord_cols):
+        # Heuristic score for a candidate mapping
+        cls_col = cls_col.astype(np.float32)
+        score_col = score_col.astype(np.float32)
+        coord_cols = coord_cols.astype(np.float32)
+
+        # class ids should be integer-like and within a reasonable range
+        cls_int_like = np.mean(np.abs(cls_col - np.round(cls_col)) < 1e-3)
+        cls_max = np.max(cls_col) if cls_col.size else 0.0
+        cls_min = np.min(cls_col) if cls_col.size else 0.0
+
+        # scores should mostly be in [0, 1.5]
+        score_in_range = np.mean((score_col >= -0.01) & (score_col <= 1.5))
+        score_std = float(np.std(score_col))
+
+        # coords should be finite
+        finite = np.mean(np.isfinite(coord_cols))
+        # coords should not be all tiny if pixel coords; allow normalized [0,1] too
+        coord_max = float(np.max(coord_cols)) if coord_cols.size else 0.0
+
+        s = 0.0
+        s += 2.0 * cls_int_like
+        s += 1.0 * (1.0 if (0 <= cls_min and cls_max <= 200) else 0.0)
+        s += 3.0 * score_in_range
+        s += 1.0 * (1.0 if score_std > 1e-5 else 0.0)
+        s += 1.0 * finite
+        s += 1.0 * (1.0 if coord_max > 1.5 else 0.5)  # prefer pixel coords but don't kill normalized
+        return s
+
+    def _try_pattern(det_arr):
+        # returns (cls, score, coords_xyxy, pattern_score)
+        n, c = det_arr.shape
+        candidates = []
+
+        # patterns: (cls_idx, score_idx, coord_idxs(list of 4))
+        # Common Paddle patterns:
+        candidates.append((1, 2, [3, 4, 5, 6]))  # [img_id, cls, score, x0,y0,x1,y1]
+        candidates.append((0, 1, [2, 3, 4, 5]))  # [cls, score, x0,y0,x1,y1, ...]
+        candidates.append((2, 1, [3, 4, 5, 6]))  # [img_id, score, cls, x0,y0,x1,y1]
+        candidates.append((0, 2, [3, 4, 5, 6]))  # [cls, img_id, score, x0,y0,x1,y1]
+        candidates.append((6, 5, [1, 2, 3, 4]))  # [img_id?, x0,y0,x1,y1, score, cls]
+        candidates.append((5, 4, [0, 1, 2, 3]))  # [x0,y0,x1,y1, score, cls, ...]
+        candidates.append((0, 6, [2, 3, 4, 5]))  # [cls, ..., x0,y0,x1,y1, score]
+        candidates.append((1, 6, [2, 3, 4, 5]))  # [img_id, ..., x0,y0,x1,y1, score]
+
+        best = None
+        best_s = -1e9
+
+        for cls_idx, score_idx, coord_idxs in candidates:
+            if max([cls_idx, score_idx] + coord_idxs) >= c:
+                continue
+            cls_col = det_arr[:, cls_idx]
+            score_col = det_arr[:, score_idx]
+            coord_cols = det_arr[:, coord_idxs]
+
+            s = _score_mapping(cls_col, score_col, coord_cols)
+
+            if s > best_s:
+                best_s = s
+                best = (cls_col, score_col, coord_cols, s, (cls_idx, score_idx, coord_idxs))
+        return best
+
+    if det.shape[1] >= 7:
+        best = _try_pattern(det)
+        if best is None:
+            raise RuntimeError(f"Unable to decode NMS output table with shape {det.shape}")
+        cls, score, coords, _, used = best
+        # print(f"[DEBUG] Using mapping cls={used[0]}, score={used[1]}, coords={used[2]}")
+    else:
+        # 6-column most common: [cls, score, x0,y0,x1,y1]
+        cls = det[:, 0]
+        score = det[:, 1]
+        coords = det[:, 2:6]
+
+    # coords may be xyxy in pixels or normalized [0,1]; normalize to pixel xyxy
+    coords = coords.astype(np.float32)
+    if np.max(coords) <= 2.0:  # normalized-ish
+        # assume coords = [x0,y0,x1,y1] normalized
+        coords[:, 0] *= float(orig_w)
+        coords[:, 2] *= float(orig_w)
+        coords[:, 1] *= float(orig_h)
+        coords[:, 3] *= float(orig_h)
+
+    # ensure x0<x1, y0<y1
+    x0 = np.minimum(coords[:, 0], coords[:, 2])
+    y0 = np.minimum(coords[:, 1], coords[:, 3])
+    x1 = np.maximum(coords[:, 0], coords[:, 2])
+    y1 = np.maximum(coords[:, 1], coords[:, 3])
+    coords = np.stack([x0, y0, x1, y1], axis=1)
+
+    boxes = np.column_stack([cls, score, coords]).astype(np.float32)
+
+    label_list = ["abstract", "algorithm", "aside_text", "chart", "content", "display_formula",
+                  "doc_title", "figure_title", "footer", "footer_image", "footnote", "formula_number",
+                  "header", "header_image", "image", "inline_formula", "number", "paragraph_title",
+                  "reference", "reference_content", "seal", "table", "text", "vertical_text", "vision_footnote"]
+
+    # Threshold filtering
+    if isinstance(threshold, float):
+        boxes = boxes[(boxes[:, 1] > threshold) & (boxes[:, 0] > -1)]
+    elif isinstance(threshold, dict):
+        filtered = []
+        for cat_id in np.unique(boxes[:, 0]).astype(int):
+            cat_boxes = boxes[boxes[:, 0] == cat_id]
+            th = float(threshold.get(int(cat_id), 0.5))
+            filtered.append(cat_boxes[(cat_boxes[:, 1] > th) & (cat_boxes[:, 0] > -1)])
+        boxes = np.vstack(filtered) if filtered else np.array([], dtype=np.float32)
+
+    if boxes.size == 0:
+        return []
+
+    # Optional NMS (usually unnecessary because model already did NMS, but kept for compatibility)
+    if layout_nms and boxes.shape[0] > 1:
+        selected_indices = nms(boxes[:, :6], iou_same=0.6, iou_diff=0.98)
+        boxes = np.array(boxes[selected_indices], dtype=np.float32)
+
+    # Optional merge/containment logic (kept as-is)
+    if layout_merge_bboxes_mode:
+        formula_index = label_list.index("formula") if "formula" in label_list else None
+        if isinstance(layout_merge_bboxes_mode, str):
+            assert layout_merge_bboxes_mode in ["union", "large", "small"]
+            if layout_merge_bboxes_mode != "union":
+                contains_other, contained_by_other = check_containment(boxes[:, :6], formula_index)
+                if layout_merge_bboxes_mode == "large":
+                    boxes = boxes[contained_by_other == 0]
+                elif layout_merge_bboxes_mode == "small":
+                    boxes = boxes[(contains_other == 0) | (contained_by_other == 1)]
+        elif isinstance(layout_merge_bboxes_mode, dict):
+            keep_mask = np.ones(len(boxes), dtype=bool)
+            for category_index, layout_mode in layout_merge_bboxes_mode.items():
+                assert layout_mode in ["union", "large", "small"]
+                if layout_mode == "union":
+                    continue
+                contains_other, contained_by_other = check_containment(
+                    boxes[:, :6], formula_index, category_index, mode=layout_mode
+                )
+                if layout_mode == "large":
+                    keep_mask &= contained_by_other == 0
+                elif layout_mode == "small":
+                    keep_mask &= (contains_other == 0) | (contained_by_other == 1)
+            boxes = boxes[keep_mask]
+        else:
+            raise ValueError("layout_merge_bboxes_mode must be str or dict")
+
+    if boxes.size == 0:
+        return []
+
+    # Optional unclip
+    if layout_unclip_ratio:
+        if isinstance(layout_unclip_ratio, float):
+            layout_unclip_ratio = (layout_unclip_ratio, layout_unclip_ratio)
+        elif isinstance(layout_unclip_ratio, (tuple, list)):
+            assert len(layout_unclip_ratio) == 2
+        elif isinstance(layout_unclip_ratio, dict):
+            pass
+        else:
+            raise ValueError(f"Unsupported layout_unclip_ratio type: {type(layout_unclip_ratio)}")
+        boxes = unclip_boxes(boxes, layout_unclip_ratio)
+
+    # Convert to dict list (clip to original image)
+    return restructured_boxes(boxes, label_list, (orig_w, orig_h))
+
 def postprocess_detections_detr(output, scale_h, scale_w, orig_h, orig_w, threshold=0.5,
                                 layout_nms=False, layout_unclip_ratio=None, layout_merge_bboxes_mode=None):
     """后处理DETR检测结果"""
@@ -571,7 +770,7 @@ def paddle_ov_doclayout(model_path, image_path, output_dir, device="GPU", thresh
     
     # 加载模型（.xml 文件会自动找到对应的 .bin 文件）
     model = core.read_model(model_path)
-    
+
     # Merge preprocessing into model
     prep = ov.preprocess.PrePostProcessor(model)
     prep.input("image").tensor().set_layout(ov.Layout("NCHW"))
@@ -587,7 +786,7 @@ def paddle_ov_doclayout(model_path, image_path, output_dir, device="GPU", thresh
     # Set batch to make static
     if device == "NPU":
         ov.set_batch(model, 1)
-
+    
     # 编译模型
     compiled_model = core.compile_model(model, device)
     
@@ -618,21 +817,24 @@ def paddle_ov_doclayout(model_path, image_path, output_dir, device="GPU", thresh
     for inp in input_tensors:
         inp_name = inp.get_any_name()
         if inp_name == "im_shape":
-            input_data[inp_name] = np.array([800, 800], dtype=np.float32)[np.newaxis, ...]
+            input_data[inp_name] = np.array([[orig_h, orig_w]], dtype=np.float32)
         elif inp_name == "image":
             input_data[inp_name] = input_blob
         elif inp_name == "scale_factor":
-            input_data[inp_name] = np.array([[scale_h, scale_w]], dtype=np.float32)
+            # IMPORTANT: For PP-DocLayoutV3-Preview exported graph, boxes are already in original-image coords.
+            # Passing resize ratios here causes an extra rescale inside the graph and makes boxes look stretched.
+            # Use [1.0, 1.0] unless you verify your model expects otherwise.
+            input_data[inp_name] = np.array([[1.0, 1.0]], dtype=np.float32)
         else:
             pass
     
     # 如果输入名称不匹配，按顺序分配
     if len(input_data) != len(input_tensors):
         input_data = {}
-        input_data[input_tensors[0].get_any_name()] = np.array([800, 800], dtype=np.float32)[np.newaxis, ...]
+        input_data[input_tensors[0].get_any_name()] = np.array([[orig_h, orig_w]], dtype=np.float32)
         input_data[input_tensors[1].get_any_name()] = input_blob
-        input_data[input_tensors[2].get_any_name()] = np.array([[scale_h, scale_w]], dtype=np.float32)
-    
+        input_data[input_tensors[2].get_any_name()] = np.array([[1.0, 1.0]], dtype=np.float32)
+
     # 创建 OpenVINO Tensor 对象
     input_tensors_ov = {}
     for inp in input_tensors:
@@ -654,13 +856,29 @@ def paddle_ov_doclayout(model_path, image_path, output_dir, device="GPU", thresh
     if layout_unclip_ratio is None:
         layout_unclip_ratio = [1.0, 1.0]
     
-    results = postprocess_detections_detr(
-        output, scale_h, scale_w, orig_h, orig_w,
-        threshold=threshold,
-        layout_nms=layout_nms,
-        layout_unclip_ratio=layout_unclip_ratio,
-        layout_merge_bboxes_mode=layout_merge_bboxes_mode
-    )
+    # Choose postprocess based on output shapes.
+    out0 = np.array(output[0]) if len(output) > 0 else None
+    out1 = np.array(output[1]) if len(output) > 1 else None
+    if out0 is not None and out0.ndim == 2 and out0.shape[0] == 300 and out0.shape[1] in (6, 7) and out1 is not None and out1.size >= 1:
+        # PaddleDetection exported (already NMS-ed) outputs
+        results = postprocess_detections_paddle_nms(
+            output,
+            orig_h=orig_h,
+            orig_w=orig_w,
+            threshold=threshold,
+            layout_nms=layout_nms,
+            layout_unclip_ratio=layout_unclip_ratio,
+            layout_merge_bboxes_mode=layout_merge_bboxes_mode,
+        )
+    else:
+        # Fallback to DETR-style postprocess (older models)
+        results = postprocess_detections_detr(
+            output, scale_h, scale_w, orig_h, orig_w,
+            threshold=threshold,
+            layout_nms=layout_nms,
+            layout_unclip_ratio=layout_unclip_ratio,
+            layout_merge_bboxes_mode=layout_merge_bboxes_mode
+        )
     
     # 创建结果对象
     result_obj = LayoutDetectionResult(
