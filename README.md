@@ -51,6 +51,30 @@ python ov_infer.py \
     --threshold 0.5
 ```
 
+#### Combine batch size and boxes node for PP-DocLayoutV2
+In PP-DocLayoutV2, its output includes two nodes, one is batch size and the other one is output boxes.
+
+* Output Nodes:
+  ```bash
+  Output 0: fetch_name_0, shape: [?,8], type: <Type: 'float32'>
+  Output 1: fetch_name_1, shape: [?], type: <Type: 'int32_t'>
+  ```
+
+To handle output easily, you can use `combine_bs_and_boxes_node.py` to combine batch size and boxes node as single output nodes and model will be saved as `<model_name>_combined.xml`.
+
+* Usage
+  ```bash
+  python combine_bs_and_boxes_node.py \
+      --model_path pp_doclayoutv2.xml \
+  ```
+
+
+* Output Nodes after combine batch size and boxes node:
+  ```bash
+  Output 0: Concat.254, shape: [?,300,8], type: <Type: 'float32'>
+  ```
+
+
 ## 📖 Parameters
 
 | Parameter | Type | Required | Default | Description |

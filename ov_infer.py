@@ -872,6 +872,9 @@ def paddle_ov_doclayout(model_path, image_path, output_dir, device="GPU", thresh
         )
     else:
         # Fallback to DETR-style postprocess (older models)
+        if output[0].ndim == 3:
+            output[0] = np.squeeze(output[0], axis = 0)
+
         results = postprocess_detections_detr(
             output, scale_h, scale_w, orig_h, orig_w,
             threshold=threshold,
@@ -952,4 +955,3 @@ def main():
 
 if __name__ == '__main__':
     main()
-
