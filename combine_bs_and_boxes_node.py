@@ -58,7 +58,7 @@ def main():
     for _result in original_results:
         ov_model.remove_result(_result)
 
-    ov.save_model(ov_model, "{}_rm.xml".format(model_path.stem))
+    ov.save_model(ov_model, "{}_combined.xml".format(model_path.stem))
 
 if __name__ == "__main__":
     main()
